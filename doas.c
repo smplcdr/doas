@@ -331,7 +331,7 @@ static __nonnull((1, 2, 3)) void authenticate(struct passwd *restrict original_p
 static inline __nonnull((1)) void substitute(struct passwd const *pw)
 {
 #if defined(HAVE_LOGIN_CAP_H)
-	if (setusercontext(NULL, pw, pw->pw_uid, LOGIN_SETGROUP | LOGIN_SETPRIORITY | LOGIN_SETRESOURCES | LOGIN_SETUMASK | LOGIN_SETUSER) != 0)
+	if (setusercontext(NULL, pw, pw->pw_uid, (Sflag ? LOGIN_SETENV : 0) | LOGIN_SETGROUP | LOGIN_SETPRIORITY | LOGIN_SETRESOURCES | LOGIN_SETUMASK | LOGIN_SETUSER) != 0)
 		errx(EXIT_FAILURE, "failed to set user context for target");
 #else
 	umask(022);
