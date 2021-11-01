@@ -31,61 +31,57 @@
  * yet exist, we replicate it here so we can get the job done.
  */
 
-#define	__EXTENSIONS__	/* to expose flockfile and friends in stdio.h */
+#define __EXTENSIONS__ 1 /* To expose flockfile and friends in stdio.h */
 #include <errno.h>
-#include <libgen.h>
+//#include <libgen.h>
 #include <malloc.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <stropts.h>
-#include <unistd.h>
 #include <termio.h>
+#include <unistd.h>
 
 #include <security/pam_appl.h>
 
-static int ctl_c;	/* was the conversation interrupted? */
+static int interrupted_p; /* Was the conversation interrupted? */
 
 /* ARGSUSED 1 */
-static void
-interrupt(int x)
+static void interrupt(int x)
 {
-	ctl_c = 1;
+	interrupted_p = 1;
 }
 
 /*
  * getinput -- read user input from stdin abort on ^C
  *
- *	Entry	noecho == TRUE, don't echo input.
+ *	Entry	noecho == TRUE, do not echo input.
  *
  *	Exit	User's input.
  *		If interrupted, send SIGINT to caller for processing.
  */
-static char *
-getinput(int noecho)
+static char *getinput(int noecho)
 {
 	struct termio tty;
-	unsigned short tty_flags = 0;
+	unsigned short int tty_flags = 0;
 	char input[PAM_MAX_RESP_SIZE + 1];
 	int c;
 	int i = 0;
 	void (*sig)(int);
 
-	ctl_c = 0;
+	interrupted_p = 0;
 	sig = signal(SIGINT, interrupt);
 	if (noecho) {
-		(void) ioctl(fileno(stdin), TCGETA, &tty);
+		(void)ioctl(fileno(stdin), TCGETA, &tty);
 		tty_flags = tty.c_lflag;
 		tty.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL);
-		(void) ioctl(fileno(stdin), TCSETAF, &tty);
+		(void)ioctl(fileno(stdin), TCSETAF, &tty);
 	}
-	/* go to end, but don't overflow PAM_MAX_RESP_SIZE */
+
+	/* Go to end, but do not overflow PAM_MAX_RESP_SIZE.  */
 	flockfile(stdin);
-	while (ctl_c == 0 &&
-	    (c = getchar_unlocked()) != '\n' &&
-	    c != '\r' &&
-	    c != EOF) {
+	while (interrupted_p == 0 && (c = getchar_unlocked()) != '\n' && c != '\r' && c != EOF) {
 		if (i < PAM_MAX_RESP_SIZE) {
 			input[i++] = (char)c;
 		}
@@ -94,22 +90,21 @@ getinput(int noecho)
 	input[i] = '\0';
 	if (noecho) {
 		tty.c_lflag = tty_flags;
-		(void) ioctl(fileno(stdin), TCSETAW, &tty);
-		(void) fputc('\n', stdout);
+		(void)ioctl(fileno(stdin), TCSETAW, &tty);
+		(void)fputc('\n', stdout);
 	}
-	(void) signal(SIGINT, sig);
-	if (ctl_c == 1)
-		(void) kill(getpid(), SIGINT);
+	(void)signal(SIGINT, sig);
+	if (interrupted_p)
+		(void)kill(getpid(), SIGINT);
 
 	return (strdup(input));
 }
 
 /*
- * Service modules don't clean up responses if an error is returned.
+ * Service modules do not clean up responses if an error is returned.
  * Free responses here.
  */
-static void
-free_resp(int num_msg, struct pam_response *pr)
+static void free_resp(int num_msg, struct pam_response *pr)
 {
 	int i;
 	struct pam_response *r = pr;
@@ -118,9 +113,8 @@ free_resp(int num_msg, struct pam_response *pr)
 		return;
 
 	for (i = 0; i < num_msg; i++, r++) {
-
-		if (r->resp) {
-			/* clear before freeing -- may be a password */
+		if (r->resp != NULL) {
+			/* Clear before freeing -- may be a password.  */
 			bzero(r->resp, strlen(r->resp));
 			free(r->resp);
 			r->resp = NULL;
@@ -130,78 +124,70 @@ free_resp(int num_msg, struct pam_response *pr)
 }
 
 /* ARGSUSED */
-int
-pam_tty_conv(int num_msg, struct pam_message **mess,
-    struct pam_response **resp, void *my_data)
+int pam_tty_conv(int num_msg, struct pam_message **mess, struct pam_response **resp, void *data)
 {
 	struct pam_message *m = *mess;
-	struct pam_response *r = calloc(num_msg, sizeof (struct pam_response));
+	struct pam_response *r = calloc(num_msg, sizeof(struct pam_response));
 	int i;
 
 	if (num_msg >= PAM_MAX_NUM_MSG) {
-		(void) fprintf(stderr, "too many messages %d >= %d\n",
-		    num_msg, PAM_MAX_NUM_MSG);
+		(void)fprintf(stderr, "too many messages %d >= %d\n", num_msg, PAM_MAX_NUM_MSG);
 		free(r);
 		*resp = NULL;
 		return (PAM_CONV_ERR);
 	}
 
-	/* Talk it out */
+	/* Talk it out.  */
 	*resp = r;
 	for (i = 0; i < num_msg; i++) {
 		int echo_off;
 
-		/* bad message from service module */
+		/* Bad message from service module.  */
 		if (m->msg == NULL) {
-			(void) fprintf(stderr, "message[%d]: %d/NULL\n",
-			    i, m->msg_style);
+			(void)fprintf(stderr, "message[%d]: %d/NULL\n", i, m->msg_style);
 			goto err;
 		}
 
 		/*
-		 * fix up final newline:
-		 * 	removed for prompts
-		 * 	added back for messages
+		 * Fix up final newline:
+		 * 	Removed for prompts.
+		 * 	Added back for messages.
 		 */
-		if (m->msg[strlen(m->msg)] == '\n')
-			m->msg[strlen(m->msg)] = '\0';
+		size_t msg_len = strlen(m->msg);
+		if (m->msg[msg_len] == '\n')
+			m->msg[msg_len] = '\0';
 
 		r->resp = NULL;
 		r->resp_retcode = 0;
 		echo_off = 0;
 		switch (m->msg_style) {
-
 		case PAM_PROMPT_ECHO_OFF:
 			echo_off = 1;
-			/*FALLTHROUGH*/
-
+			/* Fall through.  */
 		case PAM_PROMPT_ECHO_ON:
-			(void) fputs(m->msg, stdout);
-
+			(void)fputs(m->msg, stdout);
 			r->resp = getinput(echo_off);
 			break;
-
 		case PAM_ERROR_MSG:
-			(void) fputs(m->msg, stderr);
-			(void) fputc('\n', stderr);
+			(void)fputs(m->msg, stderr);
+			(void)fputc('\n', stderr);
 			break;
-
 		case PAM_TEXT_INFO:
-			(void) fputs(m->msg, stdout);
-			(void) fputc('\n', stdout);
+			(void)fputs(m->msg, stdout);
+			(void)fputc('\n', stdout);
 			break;
-
 		default:
-			(void) fprintf(stderr, "message[%d]: unknown type "
-			    "%d/val=\"%s\"\n",
-			    i, m->msg_style, m->msg);
-			/* error, service module won't clean up */
+			(void)fprintf(stderr,
+				      "message[%d]: unknown type "
+				      "%d/val=\"%s\"\n",
+				      i, m->msg_style, m->msg);
+			/* Error, service module will not clean up.  */
 			goto err;
 		}
 		if (errno == EINTR)
 			goto err;
 
-		/* next message/response */
+		/* Next message/response.  */
 		m++;
 		r++;
 	}

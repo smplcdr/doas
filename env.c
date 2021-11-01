@@ -1,6 +1,7 @@
 /* $OpenBSD: env.c,v 1.5 2016/09/15 00:58:23 deraadt Exp $ */
 /*
  * Copyright (c) 2016 Ted Unangst <tedu@openbsd.org>
+ * Copyright (c) 2021 Sergey Sushilin <sergeysushilin@protonmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,23 +16,36 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
 #include <sys/tree.h>
+#include <sys/types.h>
 
+#include <assert.h>
+#include <err.h>
+#include <errno.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pwd.h>
-#include <err.h>
 #include <unistd.h>
-#include <errno.h>
 
-#include "doas.h"
+#include "compat.h"
+#include "env.h"
+#include "rule.h"
+#include "wrappers.h"
+
+enum action {
+	ACTION_INHERIT,
+	ACTION_KEEP,
+	ACTION_SET,
+	ACTION_UNSET,
+	ACTION_FORCE
+};
 
 struct envnode {
 	RB_ENTRY(envnode) node;
-	const char *key;
-	const char *value;
+	char const *name;
+	char const *value;
+	enum action action;
 };
 
 struct env {
@@ -39,221 +53,325 @@ struct env {
 	u_int count;
 };
 
-int
-envcmp(struct envnode *a, struct envnode *b)
+static inline char const *action_to_string(enum action action) __returns_nonnull;
+static inline char const *action_to_string(enum action action)
 {
-	return strcmp(a->key, b->key);
+	switch (action) {
+	case ACTION_INHERIT:
+		return "inherit";
+	case ACTION_KEEP:
+		return "keep";
+	case ACTION_SET:
+		return "set";
+	case ACTION_UNSET:
+		return "unset";
+	case ACTION_FORCE:
+		return "force";
+	}
+
+	err(EXIT_FAILURE, "unknown action");
 }
-#ifdef __DragonFly__
+
+static inline int envcmp(struct envnode const *restrict a,
+			 struct envnode const *restrict b)
+	__nonnull((1, 2)) __wur;
+static inline int envcmp(struct envnode const *restrict a,
+			 struct envnode const *restrict b)
+{
+	return strcmp(a->name, b->name);
+}
+
+#if defined(__DragonFly__)
 RB_PROTOTYPE_STATIC(envtree, envnode, node, envcmp);
 #endif
-RB_GENERATE_STATIC(envtree, envnode, node, envcmp)
+RB_GENERATE_STATIC(envtree, envnode, node, envcmp);
 
-static struct envnode *
-createnode(const char *key, const char *value)
+static inline void destroynode(struct envnode *node) __nonnull((1));
+static inline void destroynode(struct envnode *node)
 {
-	struct envnode *node;
+	xfree(node->name);
+	xfree(node->value);
+	xfree(node);
+}
 
-	node = malloc(sizeof(*node));
-	if (!node)
-		err(1, NULL);
-	node->key = strdup(key);
-	node->value = strdup(value);
-	if (!node->key || !node->value)
-		err(1, NULL);
+static inline struct envnode *createnode(char const *restrict name,
+					 char const *restrict value,
+					 enum action action)
+	__returns_nonnull __nonnull((1)) __wur __malloc __dealloc(destroynode, 1);
+static inline struct envnode *createnode(char const *restrict name,
+					 char const *restrict value,
+					 enum action action)
+{
+	struct envnode *node = xmalloc(sizeof(*node));
+
+	node->name = xstrdup(name);
+	node->value = value == NULL ? NULL : xstrdup(value);
+	node->action = action;
+
 	return node;
 }
 
-static void
-freenode(struct envnode *node)
+static inline struct envnode *insertnode(struct env *restrict env,
+					 struct envnode *restrict node)
+	__nonnull((1, 2));
+static inline struct envnode *insertnode(struct env *restrict env,
+					 struct envnode *restrict node)
 {
-	free((char *)node->key);
-	free((char *)node->value);
-	free(node);
+	struct envnode *en = RB_INSERT(envtree, &env->root, node);
+
+	if (en == NULL)
+		env->count += (node->action != ACTION_UNSET);
+	else
+		errx(EXIT_FAILURE, "there is an element with the colliding key %s", node->name);
+
+	return en;
+}
+static inline struct envnode *removenode(struct env *restrict env,
+					 struct envnode *restrict node)
+	__returns_nonnull __nonnull((1, 2));
+static inline struct envnode *removenode(struct env *restrict env,
+					 struct envnode *restrict node)
+{
+	struct envnode *en = RB_REMOVE(envtree, &env->root, node);
+
+	if (en != NULL)
+		env->count -= (node->action != ACTION_UNSET);
+	else
+		errx(EXIT_FAILURE, "there is no element with the given key %s", node->name);
+
+	return en;
 }
 
-static void
-addnode(struct env *env, const char *key, const char *value)
+static inline int process_collision(struct env *const restrict env,
+				    struct envnode *const restrict node,
+				    char const *const restrict name,
+				    enum action action)
+	__nonnull((1, 2, 3));
+static inline int process_collision(struct env *const restrict env,
+				    struct envnode *const restrict node,
+				    char const *const restrict name,
+				    enum action action)
 {
-	struct envnode *node;
+	if ((node->action == ACTION_FORCE && action != ACTION_INHERIT)
+	 || (action == ACTION_FORCE && node->action != ACTION_INHERIT)) {
+		warnx("%s: attempt to apply %s action to forced environ variable",
+		      name, action_to_string(action == ACTION_FORCE ? node->action : action));
+		return -1;
+	}
 
-	node = createnode(key, value);
-	RB_INSERT(envtree, &env->root, node);
-	env->count++;
+	switch (node->action) {
+	case ACTION_INHERIT:
+		/* Inherited environs never repeat, so just remove previous entry.  */
+		destroynode(removenode(env, node));
+		break;
+	case ACTION_KEEP:
+	case ACTION_SET:
+	case ACTION_UNSET:
+		if (action != node->action)
+			warnx("%s: attempt to do two different actions (%s and %s)",
+			      name, action_to_string(node->action), action_to_string(action));
+		else
+			warnx("%s environ specified twice in %senv section", name, action_to_string(action));
+		return -1;
+	}
+
+	return 0;
 }
 
-
-/* Copy an original (possibly static in memory) password structure.
-Make a deep copy of it so that our original andtarget do not overlap
-on future calls.
-*/
-struct passwd *
-copyenvpw(struct passwd *my_static)
+void defaultenv(struct env *const restrict env,
+		struct passwd const *const restrict original,
+		struct passwd const *const restrict target)
 {
-    struct passwd *new_pw;
+	struct envnode envlist[] = {
+		{ .name = "DISPLAY",	.value = getenv("DISPLAY"),	.action = ACTION_INHERIT },
+		{ .name = "TERM",	.value = getenv("TERM"),	.action = ACTION_INHERIT },
+		{ .name = "HOME",	.value = target->pw_dir,	.action = ACTION_INHERIT },
+		{ .name = "DOAS_USER",	.value = original->pw_name,	.action = ACTION_FORCE },
+		{ .name = "LOGNAME",	.value = target->pw_name,	.action = ACTION_FORCE },
+		{ .name = "PATH",	.value = GLOBAL_PATH,		.action = ACTION_FORCE },
+		{ .name = "SHELL",	.value = target->pw_shell,	.action = ACTION_FORCE },
+		{ .name = "USER",	.value = target->pw_name,	.action = ACTION_FORCE },
+	};
 
-    if (! my_static)
-        return NULL;
-    new_pw = (struct passwd *) calloc(1, sizeof(struct passwd));
-    if (! new_pw)
-        return NULL;
-
-    new_pw->pw_name = strdup(my_static->pw_name);
-    new_pw->pw_passwd = strdup(my_static->pw_passwd);
-    new_pw->pw_uid = my_static->pw_uid;
-    new_pw->pw_gid = my_static->pw_gid;
-    new_pw->pw_gecos = strdup(my_static->pw_gecos);
-    new_pw->pw_dir = strdup(my_static->pw_dir);
-    new_pw->pw_shell = strdup(my_static->pw_shell);
-    return new_pw;
-}
-
-
-static struct env *
-createenv(struct rule *rule, struct passwd *original, struct passwd *target)
-{
-	struct env *env;
-	u_int i;
-
-	env = malloc(sizeof(*env));
-	if (!env)
-		err(1, NULL);
-	RB_INIT(&env->root);
-	env->count = 0;
-
-        addnode(env, "DOAS_USER", original->pw_name);
-	if (rule->options & KEEPENV)
-           addnode(env, "HOME", original->pw_dir);
-        else
-           addnode(env, "HOME", target->pw_dir);
-	addnode(env, "LOGNAME", target->pw_name);
-	addnode(env, "PATH", GLOBAL_PATH); 
-	addnode(env, "SHELL", target->pw_shell);
-	addnode(env, "USER", target->pw_name);
-
-	if (rule->options & KEEPENV) {
-                #ifndef linux
-		extern const char **environ;
-                #endif
-
-		for (i = 0; environ[i] != NULL; i++) {
+	for (int i = 0; i < countof(envlist); i++) {
+		if (envlist[i].value != NULL) {
 			struct envnode *node;
-			const char *e, *eq;
-			size_t len;
-			char name[1024];
 
-			e = environ[i];
+			/* Process previous copies.  */
+			if ((node = RB_FIND(envtree, &env->root, &envlist[i])) != NULL)
+				process_collision(env, node,
+						  envlist[i].name,
+						  envlist[i].action);
 
-			/* ignore invalid or overlong names */
-			if ((eq = strchr(e, '=')) == NULL || eq == e)
-				continue;
-			len = eq - e;
-			if (len > sizeof(name) - 1)
-				continue;
-			memcpy(name, e, len);
-			name[len] = '\0';
-
-			node = createnode(name, eq + 1);
-			if (RB_INSERT(envtree, &env->root, node)) {
-				/* ignore any later duplicates */
-				freenode(node);
-			} else {
-				env->count++;
-			}
+			/* Assign value.  */
+			insertnode(env, createnode(envlist[i].name,
+						   envlist[i].value,
+						   envlist[i].action));
 		}
 	}
+}
+
+void inheritenv(struct env *env)
+{
+	char const *const *envp;
+
+	for (envp = (char const *const *)environ; *envp != NULL; envp++) {
+		char const *e = *envp;
+		char const *const eq = strchr(e, '=');
+		struct envnode *node;
+		struct envnode key = { .name = NULL, .value = NULL };
+
+		key.name = xstrndup(e, eq - e);
+
+		/* Process previous copies.  */
+		/* If there is any environ with the same name, then yield.  */
+		if ((node = RB_FIND(envtree, &env->root, &key)) == NULL) {
+			key.value = eq + 1;
+
+			/* At last, we have something to insert.  */
+			insertnode(env, createnode(key.name, key.value, ACTION_INHERIT));
+		}
+
+		xfree(key.name);
+	}
+}
+
+int keepenv(struct env *const restrict env,
+	    char const *const restrict *const restrict envlist)
+{
+	char const *const restrict *envp;
+
+	for (envp = envlist; *envp != NULL; envp++) {
+		struct envnode *node;
+		struct envnode key = { .name = *envp, .value = NULL };
+		char const *eq = strchr(key.name, '=');
+
+		if (eq != NULL) {
+			key.name = xstrndup(key.name, eq - key.name);
+			key.value = eq + 1;
+
+			if (*key.value != '$') {
+				warnx("$ character expected just after =");
+				return -1;
+			}
+
+			key.value++;
+		}
+
+		/* Process previous copies.  */
+		if ((node = RB_FIND(envtree, &env->root, &key)) != NULL)
+			if (process_collision(env, node, key.name, ACTION_KEEP) != 0)
+				return -1;
+
+		/* Inherit from environ.  */
+		key.value = getenv(key.value != NULL ? key.value : key.name);
+
+		/* At last, we have something to insert.  */
+		if (key.value != NULL)
+			insertnode(env, createnode(key.name, key.value, ACTION_KEEP));
+	}
+
+	return 0;
+}
+
+int fillenv(struct env *restrict env,
+	    char const *const restrict *const restrict envlist)
+{
+	char const *const restrict *envp;
+
+	for (envp = envlist; *envp != NULL; envp++) {
+		char const *const e = *envp;
+		struct envnode *node, key = { .name = NULL, .value = NULL };
+
+		/* Parse out environ name.  */
+		char const *const eq = strchr(e, '=');
+
+		if (eq == NULL) {
+			warnc(EINVAL, "expected NAME=VALUE, but got: %s", e);
+			return -1;
+		}
+
+		key.name = xstrndup(e, eq - e);
+
+		/* Process previous copies.  */
+		if ((node = RB_FIND(envtree, &env->root, &key)) != NULL)
+		        if (process_collision(env, node, key.name, ACTION_SET) != 0)
+				return -1;
+
+		/* Assign value.  */
+		insertnode(env, createnode(key.name, eq + 1, ACTION_SET));
+
+		xfree(key.name);
+	}
+
+	return 0;
+}
+
+int unfillenv(struct env *restrict env,
+	      char const *const restrict *const restrict envlist)
+{
+	char const *const restrict *envp;
+
+	for (envp = envlist; *envp != NULL; envp++) {
+		struct envnode *node;
+		struct envnode key = { .name = *envp, .value = NULL };
+
+		if (strchr(key.name, '=') != NULL) {
+			warnc(EINVAL, "unexpected '=' character in environ name: %s", key.name);
+			return -1;
+		}
+
+		if ((node = RB_FIND(envtree, &env->root, &key)) != NULL)
+		        if (process_collision(env, node, key.name, ACTION_UNSET) != 0)
+				return -1;
+
+		insertnode(env, createnode(key.name, NULL, ACTION_UNSET));
+	}
+
+	return 0;
+}
+
+struct env *createenv(void)
+{
+	struct env *env = xmalloc(sizeof(*env));
+
+	RB_INIT(&env->root);
+	env->count = 0;
 
 	return env;
 }
 
-static char **
-flattenenv(struct env *env)
+static inline __malloc __returns_nonnull __nonnull((1)) __wur char **flattenenv(struct env *env)
 {
-	char **envp;
-	struct envnode *node;
-	u_int i;
+	struct envnode *node, *next_node;
+	u_int i = 0;
+	char **envp = xreallocarray(NULL, env->count + 1, sizeof(char *));
 
-	envp = reallocarray(NULL, env->count + 1, sizeof(char *));
-	if (!envp)
-		err(1, NULL);
-	i = 0;
-	RB_FOREACH(node, envtree, &env->root) {
-		if (asprintf(&envp[i], "%s=%s", node->key, node->value) == -1)
-			err(1, NULL);
-		i++;
+	RB_FOREACH_SAFE(node, envtree, &env->root, next_node) {
+		if (node->action != ACTION_UNSET) {
+			size_t name_length = strlen(node->name);
+			size_t value_length = strlen(node->value);
+			char *e = xmalloc(name_length + 1 + value_length + 1);
+
+			memcpy(e, node->name, name_length);
+			e[name_length] = '=';
+			memcpy(e + name_length + 1, node->value, value_length);
+			e[name_length + value_length + 1] = '\0';
+
+			envp[i++] = e;
+		}
+
+		destroynode(removenode(env, node));
 	}
+
+	xfree(env);
+
 	envp[i] = NULL;
+
 	return envp;
 }
 
-static void
-fillenv(struct env *env, const char **envlist)
+char **prepenv(struct env *const restrict env)
 {
-	struct envnode *node, key;
-	const char *e, *eq;
-	const char *val;
-	char name[1024];
-	u_int i;
-	size_t len;
-
-	for (i = 0; envlist[i]; i++) {
-		e = envlist[i];
-
-		/* parse out env name */
-		if ((eq = strchr(e, '=')) == NULL)
-			len = strlen(e);
-		else
-			len = eq - e;
-		if (len > sizeof(name) - 1)
-			continue;
-		memcpy(name, e, len);
-		name[len] = '\0';
-
-		/* delete previous copies */
-		key.key = name;
-		if (*name == '-')
-			key.key = name + 1;
-		if ((node = RB_FIND(envtree, &env->root, &key))) {
-			RB_REMOVE(envtree, &env->root, node);
-			freenode(node);
-			env->count--;
-		}
-		if (*name == '-')
-			continue;
-
-		/* assign value or inherit from environ */
-		if (eq) {
-			val = eq + 1;
-			if (*val == '$')
-				val = getenv(val + 1);
-		} else {
-			val = getenv(name);
-		}
-		/* at last, we have something to insert */
-		if (val) {
-			node = createnode(name, val);
-			RB_INSERT(envtree, &env->root, node);
-			env->count++;
-		}
-	}
-}
-
-char **
-prepenv(struct rule *rule, struct passwd *original, struct passwd *target)
-{
-        static const char *safeset[] = {
-                "DISPLAY", "TERM", NULL
-        };
-
-	struct env *env;
-
-	env = createenv(rule, original, target);
-
-	/* if we started with blank, fill some defaults then apply rules */
-	if (!(rule->options & KEEPENV))
-		fillenv(env, safeset);
-	if (rule->envlist)
-		fillenv(env, rule->envlist);
-
 	return flattenenv(env);
 }

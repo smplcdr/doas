@@ -1,6 +1,7 @@
 /* $OpenBSD: doas.c,v 1.57 2016/06/19 19:29:43 martijn Exp $ */
 /*
  * Copyright (c) 2015 Ted Unangst <tedu@openbsd.org>
+ * Copyright (c) 2021 Sergey Sushilin <sergeysushilin@protonmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,564 +16,729 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-
 #if defined(HAVE_INTTYPES_H)
-#include <inttypes.h>
+# include <inttypes.h>
 #endif
 
-#include <limits.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#if _POSIX_C_SOURCE >= 200809L || _GNU_SOURCE
+# define HAVE_FEXECVE 1
+#else
+# define HAVE_FEXECVE 0
+#endif
+
+#include <assert.h>
 #include <err.h>
-#include <unistd.h>
-#include <pwd.h>
-#include <grp.h>
-#include <syslog.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <paths.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <syslog.h>
+#include <unistd.h>
 
 #if defined(HAVE_LOGIN_CAP_H)
-#include <login_cap.h>
+# include <login_cap.h>
+#endif /* HAVE_LOGIN_CAP_H */
+
+#include "compat.h"
+#include "env.h"
+#include "rule.h"
+#if USE_TIMESTAMP
+# include "timestamp.h"
 #endif
+#include "wrappers.h"
 
 #if defined(USE_BSD_AUTH)
-#include <bsd_auth.h>
-#include <readpassphrase.h>
+extern __nonnull((1, 2)) void authuser(char const *restrict doas_prompt, char const *restrict name, char const *restrict login_style, bool persist);
+#elif defined(USE_PAM)
+extern void pamauth(char const *restrict doas_prompt, char const *restrict target_name, char const *restrict original_name);
+#elif defined(USE_SHADOW)
+extern __nonnull((1)) void shadowauth(char const *restrict doas_prompt, char const *name);
 #endif
 
-#if defined(USE_PAM)
-#include <security/pam_appl.h>
+extern struct rule const *const rules;
+extern size_t const nrules;
 
-#if defined(OPENPAM) /* BSD, MacOS & certain Linux distros */
-#include <security/openpam.h>
-static struct pam_conv pamc = { openpam_ttyconv, NULL };
+extern void check_permissions(char const *filename)
+	__nonnull((1));
+extern u_int parse_config(char const *filename)
+	__nonnull((1));
 
-#elif defined(__LINUX_PAM__) /* Linux */
-#include <security/pam_misc.h>
-static struct pam_conv pamc = { misc_conv, NULL };
-
-#elif defined(SOLARIS_PAM) /* illumos & Solaris */
-#include "pm_pam_conv.h"
-static struct pam_conv pamc = { pam_tty_conv, NULL };
-
-#endif /* OPENPAM */
-#endif /* USE_PAM */
-
-#include "doas.h"
-
-static void 
-usage(void)
+static inline __noreturn void usage(void)
 {
-	fprintf(stderr, "usage: doas [-nSs] [-a style] [-C config] [-u user]"
-	    " command [args]\n");
-	exit(1);
+	fputs("usage: doas [-dnSs] [-a style] [-c command] [-C config]"
+	      " [-u user] program [args]\n", stderr);
+	exit(EXIT_FAILURE);
 }
 
-static int
-parseuid(const char *s, uid_t *uid)
+static __nonnull((1)) void print_rule(struct rule const *rule)
 {
-	struct passwd *pw;
-        pw = getpwnam(s);
-	if (pw != NULL) {
-		*uid = pw->pw_uid;
-		return 0;
+	printf("%s", rule->permit ? "permit" : "deny");
+
+	if (rule->keepenvlist != NULL) {
+		char const *const *e;
+
+		printf(" keepenv {");
+
+		for (e = rule->keepenvlist; *e != NULL; e++)
+			printf(" \"%s\"%s", *e, *(e + 1) != NULL ? "," : "");
+
+		printf(" }");
 	}
-	return -1;
-}
 
-static int
-uidcheck(const char *s, uid_t desired)
-{
-	uid_t uid;
+	if (rule->setenvlist != NULL) {
+		char const *const *e;
 
-	if (parseuid(s, &uid) != 0)
-		return -1;
-	if (uid != desired)
-		return -1;
-	return 0;
-}
+		printf(" setenv {");
 
-static int
-parsegid(const char *s, gid_t *gid)
-{
-	struct group *gr;
-        gr = getgrnam(s);
-	if (gr != NULL) {
-		*gid = gr->gr_gid;
-		return 0;
+		for (e = rule->setenvlist; *e != NULL; e++)
+			printf(" \"%s\"%s", *e, *(e + 1) != NULL ? "," : "");
+
+		printf(" }");
 	}
-	return -1;
-}
 
-static int
-match(uid_t uid, gid_t *groups, int ngroups, uid_t target, const char *cmd,
-    const char **cmdargs, struct rule *r)
-{
-	int i;
+	if (rule->unsetenvlist != NULL) {
+		char const *const *e;
 
-	if (r->ident[0] == ':') {
-		gid_t rgid;
-		if (parsegid(r->ident + 1, &rgid) == -1)
-			return 0;
-		for (i = 0; i < ngroups; i++) {
-			if (rgid == groups[i])
-				break;
-		}
-		if (i == ngroups)
-			return 0;
-	} else {
-		if (uidcheck(r->ident, uid) != 0)
-			return 0;
+		printf(" unsetenv {");
+
+		for (e = rule->unsetenvlist; *e != NULL; e++)
+			printf(" \"%s\"%s", *e, *(e + 1) != NULL ? "," : "");
+
+		printf(" }");
 	}
-	if (r->target && uidcheck(r->target, target) != 0)
-		return 0;
-	if (r->cmd) {
-		if (strcmp(r->cmd, cmd))
-			return 0;
-		if (r->cmdargs) {
-			/* if arguments were given, they should match explicitly */
-			for (i = 0; r->cmdargs[i]; i++) {
-				if (!cmdargs[i])
-					return 0;
-				if (strcmp(r->cmdargs[i], cmdargs[i]))
-					return 0;
+
+	if (rule->persist_time != 0)
+		printf(" persist(%lu)", (u_long)rule->persist_time);
+
+	if (rule->inheritenv)
+		printf(" inheritenv");
+
+	if (rule->nopass)
+		printf(" nopass");
+
+	if (rule->nolog)
+		printf(" nolog");
+
+	if (rule->ident.pw != NULL)
+		printf(" '%s'", rule->ident.pw->pw_name);
+
+	if (rule->ident.gr != NULL)
+		printf(" from '%s'", rule->ident.gr->gr_name);
+
+	printf(" as '%s'", rule->target.pw->pw_name);
+
+	if (rule->argc != 0) {
+		if (rule->argv == NULL) {
+			printf(" execute { ... }");
+		} else {
+			int i;
+
+			printf(" execute { ");
+
+			/* TODO: optimize comparation and commas.  */
+			for (i = 0; rule->argv[i] != NULL; i++) {
+				assert(rule->argv[i][0] != NULL);
+
+				if (rule->argv[i][1] == NULL)
+					printf("\"%s\"", rule->argv[i][0]);
+				else {
+					int j = 0;
+					printf("[");
+
+					while (rule->argv[i][j] != NULL) {
+						printf("\"%s\"", rule->argv[i][j]);
+
+						if (rule->argv[i][++j] != NULL)
+							printf(", ");
+					}
+
+					printf("]");
+				}
+
+				if (rule->argv[i + 1] != NULL)
+					printf(", ");
 			}
-			if (cmdargs[i])
-				return 0;
+
+			if (i != rule->argc)
+				printf(" ...");
+
+			printf(" }");
 		}
 	}
-	return 1;
+
+	printf("\n");
 }
 
-static int
-permit(uid_t uid, gid_t *groups, int ngroups, struct rule **lastr,
-    uid_t target, const char *cmd, const char **cmdargs)
+static bool match(uid_t uid, gid_t const *restrict groups, u_int ngroups,
+		  uid_t target_uid, int argc, char const *const restrict *restrict argv,
+		  struct rule const *restrict r)
 {
-	int i;
+	if (uid != ROOT_UID)
+		if (r->ident.pw != NULL && r->ident.pw->pw_uid != uid)
+			return false;
 
-	*lastr = NULL;
-	for (i = 0; i < nrules; i++) {
-		if (match(uid, groups, ngroups, target, cmd,
-		    cmdargs, rules[i]))
-			*lastr = rules[i];
+	if (r->ident.gr != NULL) {
+		u_int i;
+		gid_t rgid = r->ident.gr->gr_gid;
+
+		for (i = 0; i < ngroups && rgid != groups[i]; i++)
+			continue;
+
+		if (i == ngroups)
+			return false;
 	}
-	if (!*lastr)
-		return 0;
-	return (*lastr)->action == PERMIT;
+
+	if (r->target.pw != NULL && r->target.pw->pw_uid != target_uid)
+		return false;
+
+	if (r->argv != NULL) {
+		int i;
+
+		if (r->argv[r->argc] == NULL && r->argc != argc)
+			return false;
+
+		/* Do not rely on r->argc since r->argv[r->argc] does not
+		   point to NULL, when ellipsis used in rule
+		   (in case r->argv[r->argc] != NULL && r->argc != argc).  */
+		for (i = 0; r->argv[i] != NULL; i++) {
+			int j;
+
+			if (argv[i] == NULL)
+				return false;
+
+			for (j = 0; r->argv[i][j] != NULL; j++)
+				if (streq(r->argv[i][j], argv[i]))
+					break;
+
+			if (r->argv[i][j] == NULL)
+				return false;
+		}
+	}
+
+	return true;
 }
 
-static void
-parseconfig(const char *filename, int checkperms)
+static bool permit(uid_t uid, gid_t const *restrict groups, u_int ngroups,
+		   uid_t target, int argc, char const *const restrict *restrict argv,
+		   struct rule const *restrict *restrict lastr)
 {
-	extern FILE *yyfp;
-	extern int yyparse(void);
+	u_int i = nrules;
+
+	static struct rule basic_rule = {
+		/* Do not keep environ to allow user execute command
+		   with clean environ.	*/
+		.nopass = true,
+		.nolog = true,
+		.permit = true
+	};
+
+	if (basic_rule.env == NULL)
+		basic_rule.env = createenv();
+
+	if (uid == ROOT_UID) {
+		/* But nothing else matters.  */
+		/* Root is allowed to do anything (not necessarily
+		   for love).  */
+		*lastr = &basic_rule;
+		return true;
+	}
+
+	while (i-- != 0) {
+		if (match(uid, groups, ngroups, target, argc, argv, &rules[i])) {
+			*lastr = &rules[i];
+			return (*lastr)->permit;
+		}
+	}
+
+	if (uid == target) {
+		*lastr = &basic_rule;
+		return true;
+	} else {
+		*lastr = NULL;
+		return false;
+	}
+}
+
+static __noreturn void check_config(char const *restrict confpath,
+				    int argc, char const *const restrict *restrict argv,
+				    uid_t uid, gid_t const *restrict groups,
+				    u_int ngroups, uid_t target)
+{
+	struct rule const *rule;
+	int status;
+
+	if (setresuid(uid, uid, uid) < 0)
+		errx(EXIT_FAILURE, "unable to set uid to %lu", (u_long)uid);
+
+	if (parse_config(confpath) != 0)
+		exit(EXIT_FAILURE);
+
+	if (argc == 0)
+		exit(EXIT_SUCCESS);
+
+	status = permit(uid, groups, ngroups, target, argc, argv, &rule) ? EXIT_SUCCESS : EXIT_FAILURE;
+
+	if (rule != NULL)
+		print_rule(rule);
+
+	exit(status);
+}
+
+static __nonnull((1, 2, 3)) void authenticate(struct passwd *restrict original_pw, struct passwd *restrict target_pw, char *restrict login_style, bool persist)
+{
+	static char host[HOST_NAME_MAX + 1] = { '\0' };
+	char format[] = "\rdoas (%s@%s) password: ";
+	char prompt[256];
+
+	if (host[0] == '\0' && gethostname(host, sizeof(host)) < 0) {
+		host[0] = '?';
+		host[1] = '\0';
+	}
+
+	if (sizeof(format) - 1 + strlen(original_pw->pw_name) + strlen(host) + 1 >= sizeof(prompt))
+		strcpy(prompt, "Password: ");
+	else
+		xsnprintf(prompt, sizeof(prompt), format, original_pw->pw_name, host);
+
+#if defined(USE_BSD_AUTH)
+	authuser(prompt, target_pw->pw_name, login_style, persist);
+#elif defined(USE_PAM)
+	(void)login_style;
+	(void)persist;
+	pamauth(prompt, target_pw->pw_name, original_pw->pw_name);
+#elif defined(USE_SHADOW)
+	(void)target_pw;
+	(void)login_style;
+	(void)persist;
+	shadowauth(prompt, original_pw->pw_name);
+#else
+	(void)original_pw;
+	(void)target_pw;
+	(void)login_style;
+	(void)persist;
+	/* No authentication provider, only allow nopass rules.  */
+	errx(EXIT_FAILURE, "no authentication module");
+#endif
+}
+
+/* Substitute current user by user given in pw.  */
+static inline __nonnull((1)) void substitute(struct passwd const *pw)
+{
+#if defined(HAVE_LOGIN_CAP_H)
+	if (setusercontext(NULL, pw, pw->pw_uid, LOGIN_SETGROUP | LOGIN_SETPRIORITY | LOGIN_SETRESOURCES | LOGIN_SETUMASK | LOGIN_SETUSER) != 0)
+		errx(EXIT_FAILURE, "failed to set user context for target");
+#else
+	umask(022);
+
+	if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) < 0)
+		err(EXIT_FAILURE, "setresgid");
+
+	if (initgroups(pw->pw_name, pw->pw_gid) < 0)
+		err(EXIT_FAILURE, "initgroups");
+
+	if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) < 0)
+		err(EXIT_FAILURE, "setresuid");
+#endif
+}
+
+static inline bool checkshell(char const *shell)
+{
 	struct stat sb;
 
-	yyfp = fopen(filename, "r");
-	if (!yyfp)
-		err(1, checkperms ? "doas is not enabled, %s" :
-		    "could not open config file %s", filename);
-
-	if (checkperms) {
-		if (fstat(fileno(yyfp), &sb) != 0)
-			err(1, "fstat(\"%s\")", filename);
-		if ((sb.st_mode & (S_IWGRP|S_IWOTH)) != 0)
-			errx(1, "%s is writable by group or other", filename);
-		if (sb.st_uid != 0)
-			errx(1, "%s is not owned by root", filename);
-	}
-
-	yyparse();
-	fclose(yyfp);
-	if (parse_errors)
-		exit(1);
+	return shell != NULL && *shell == '/'
+		&& (eaccess(shell, X_OK) == 0
+		    || (stat(shell, &sb) == 0 && S_ISREG(sb.st_mode)
+			&& (geteuid() != ROOT_UID || (sb.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0)));
 }
 
-static void 
-checkconfig(const char *confpath, int argc, char **argv,
-    uid_t uid, gid_t *groups, int ngroups, uid_t target)
+static inline __returns_nonnull char *getshell(struct passwd const *target_pw)
 {
-	struct rule *rule;
-        int status;
+	size_t i;
+	char const *const shells[] = { getenv("SHELL"), target_pw->pw_shell, _PATH_BSHELL };
 
-	#if defined(__linux__) || defined(__FreeBSD__)
-	status = setresuid(uid, uid, uid);
-	#else
-	status = setreuid(uid, uid);
-	#endif
-	if (status == -1)
-		errx(1, "unable to set uid to %d", uid);
+	for (i = 0; i < countof(shells); i++)
+		if (checkshell(shells[i]))
+			return xstrdup(shells[i]);
 
-	parseconfig(confpath, 0);
-	if (!argc)
-		exit(0);
-
-	if (permit(uid, groups, ngroups, &rule, target, argv[0],
-	    (const char **)argv + 1)) {
-		printf("permit%s\n", (rule->options & NOPASS) ? " nopass" : "");
-		exit(0);
-	} else {
-		printf("deny\n");
-		exit(1);
-	}
+	errx(EXIT_FAILURE, "can not find shell");
 }
 
-#if defined(USE_BSD_AUTH)      
-static void
-authuser(char *myname, char *login_style, int persist)
+static inline __nonnull((1)) void path_filter(char *const path)
 {
-	char *challenge = NULL, *response, rbuf[1024], cbuf[128];
-	auth_session_t *as;
-	int fd = -1;
+	char *colon = path;
+	char *s = path;
 
-	if (persist)
-		fd = open("/dev/tty", O_RDWR);
-	if (fd != -1) {
-		if (ioctl(fd, TIOCCHKVERAUTH) == 0)
-			goto good;
+	/*
+	 * Every entry in $PATH must:
+	 *   1) exist
+	 *   2) be directory
+	 *   3) not be writable by group or other
+	 *   4) be owned by root
+	 */
+
+	while (true) {
+		struct stat sb;
+		char const *directory = colon;
+
+		colon = strchr(colon, ':');
+
+		if (colon == NULL)
+			break;
+
+		*colon++ = '\0';
+
+		if (stat(directory, &sb) != 0) {
+			warn("%s", directory);
+			goto skip;
+		}
+
+		if (!S_ISDIR(sb.st_mode)) {
+			warnc(ENOTDIR, "%s", directory);
+			goto skip;
+		}
+
+		if (sb.st_mode & (S_IWGRP | S_IWOTH)) {
+			warnx("%s is writable by group or other", directory);
+			goto skip;
+		}
+
+		if (sb.st_uid != ROOT_UID || sb.st_gid != ROOT_UID) {
+			warnx("%s is not owned by root", directory);
+			goto skip;
+		}
+
+		size_t directory_length = colon - directory - 1;
+		memcpy(s, directory, directory_length);
+		s[directory_length] = ':';
+		s += directory_length + 1;
+		continue;
+
+	skip:
+		warnx("%s is not kept in $PATH", directory);
 	}
 
-	if (!(as = auth_userchallenge(myname, login_style, "auth-doas",
-	    &challenge)))
-		errx(1, "Authorization failed");
-	if (!challenge) {
-		char host[HOST_NAME_MAX + 1];
-		if (gethostname(host, sizeof(host)))
-			snprintf(host, sizeof(host), "?");
-		snprintf(cbuf, sizeof(cbuf),
-		    "\rdoas (%.32s@%.32s) password: ", myname, host);
-		challenge = cbuf;
+	s[-1] = '\0';
+}
+
+#if HAVE_FEXECVE
+/* Returns only valid file descriptor.  */
+static inline __nonnull((1, 2)) __wur int find_and_open_program(char const *const restrict name, char const *const restrict path)
+{
+	int fd;
+	char *full_path;
+	size_t longest_path_size = 0;
+	char const *p1 = path;
+	char const *p2 = strchrnul(path, ':');
+
+	/* If program name contain '/', then do not search program in the $PATH
+	   or if $PATH is not set, the default search path is implementation
+	   dependent.  */
+	if (strchr(name, '/') != NULL || *p1 == '\0') {
+		fd = safe_open(name, O_RDONLY, 0);
+
+		if (faccessat(fd, "", X_OK, AT_EACCESS | AT_EMPTY_PATH) != 0)
+			err(EXIT_FAILURE, "%s: file is not executable", name);
+
+		return fd;
 	}
-	response = readpassphrase(challenge, rbuf, sizeof(rbuf),
-	    RPP_REQUIRE_TTY);
-	if (response == NULL && errno == ENOTTY) {
-		syslog(LOG_AUTHPRIV | LOG_NOTICE,
-		    "tty required for %s", myname);
-		errx(1, "a tty is required");
-	}
-	if (!auth_userresponse(as, response, 0)) {
-		syslog(LOG_AUTHPRIV | LOG_NOTICE,
-		    "failed auth for %s", myname);
-		errc(1, EPERM, NULL);
-	}
-	explicit_bzero(rbuf, sizeof(rbuf));
-good:
-	if (fd != -1) {
-		int secs = 5 * 60;
-		ioctl(fd, TIOCSETVERAUTH, &secs);
-		close(fd);
-	}
+
+	do {
+		if (p2 - p1 > longest_path_size)
+			longest_path_size = p2 - p1;
+
+		p1 = p2 + 1;
+	} while (*p2 != '\0' && (p2 = strchrnul(p2 + 1, ':')) != NULL);
+
+	full_path = xmalloc(longest_path_size + strlen(name) + 1);
+
+	p1 = path;
+	p2 = strchrnul(path, ':');
+
+	do {
+		struct stat sb;
+		size_t const path_length = p2 - p1;
+		char *p = memcpy(full_path, p1, path_length);
+
+		p[path_length] = '/';
+		strcpy(p + path_length + 1, name);
+
+		fd = open(full_path, O_RDONLY);
+
+		if (fd < 0) {
+			if (errno == ENOENT)
+				continue;
+			else
+				err(EXIT_FAILURE, "can not open %s", full_path);
+		}
+
+		if (faccessat(fd, "", X_OK, AT_EACCESS | AT_EMPTY_PATH) != 0)
+			err(EXIT_FAILURE, "%s: file is not executable", full_path);
+
+		/* Check that the progpathname does not point to a directory.  */
+		if (fstatat(fd, "", &sb, AT_EMPTY_PATH) != 0)
+			err(EXIT_FAILURE, "can not stat %s", full_path);
+		else if (S_ISDIR(sb.st_mode))
+			errc(EXIT_FAILURE, EISDIR, "%s", full_path);
+
+		xfree(full_path);
+
+		return fd;
+	} while (*p2 != '\0' && (p1 = p2 + 1, p2 = strchrnul(p2 + 1, ':')) != NULL);
+
+	err(EXIT_FAILURE, "can not find %s", name);
 }
 #endif
 
-int
-main(int argc, char **argv)
+int main(int argc, char **argv)
 {
-	const char *safepath = SAFE_PATH;
-	const char *confpath = NULL;
-	char *shargv[] = { NULL, NULL };
-	char *sh;
-	const char *cmd;
+	char safepath[] = SAFE_PATH;
+	char *formerpath;
+	char const *confpath = NULL;
+	char *path;
+	char const *cmd = NULL;
+	char *argv0;
 	char cmdline[LINE_MAX];
-	char myname[_PW_NAME_LEN + 1];
-	struct passwd *original_pw, *target_pw, *temp_pw; 
-	struct rule *rule;
-	uid_t uid;
-	uid_t target = 0;
-	gid_t groups[NGROUPS_MAX + 1];
+	struct rule const *rule;
+	gid_t *groups;
 	int ngroups;
-	int i, ch;
-	int Sflag = 0;
-	int sflag = 0;
-	int nflag = 0;
-	char cwdpath[PATH_MAX];
-	const char *cwd;
-        #if defined(USE_BSD_AUTH)
+	int i, optc;
+	bool Sflag = false, sflag = false, nflag = false;
 	char *login_style = NULL;
-        #endif
 	char **envp;
+#if defined(USE_TIMESTAMP)
+	int timestamp_fd = -1;
+	bool timestamp_valid = false;
+#endif
+#if HAVE_FEXECVE
+	int execfd;
+	char hashbang[2];
+#endif
+	extern struct passwd *original_pw, *target_pw;
 
-	setprogname("doas");
+	setprogname(argv[0]);
 
 	closefrom(STDERR_FILENO + 1);
 
-	uid = getuid();
+	if (!isatty(STDERR_FILENO))
+		exit(EXIT_FAILURE);
 
-	while ((ch = getopt(argc, argv, "+a:C:nSsu:")) != -1) {
-		switch (ch) {
-                #if defined(USE_BSD_AUTH)
+	if (!isatty(STDIN_FILENO))
+		err(EXIT_FAILURE, "stdin is not a tty");
+
+	while ((optc = getopt(argc, argv, "+a:c:C:eLu:nSs")) >= 0) {
+		switch (optc) {
 		case 'a':
 			login_style = optarg;
 			break;
-                #endif
 		case 'C':
 			confpath = optarg;
 			break;
-/*		case 'L':
-			i = open("/dev/tty", O_RDWR);
-			if (i != -1)
-				ioctl(i, TIOCCLRVERAUTH);
-			exit(i != -1);
-*/
+		case 'c':
+			cmd = optarg;
+			break;
+		case 'L':
+#if defined(USE_TIMESTAMP)
+			exit(timestamp_clear() == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+#elif defined(TIOCCLRVERAUTH)
+			exit((i = open(_PATH_TTY, O_RDWR)) >= 0 && ioctl(i, TIOCCLRVERAUTH) == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+#else
+			warn("no timestamp module");
+			exit(EXIT_SUCCESS);
+#endif
 		case 'u':
-			if (parseuid(optarg, &target) != 0)
-				errx(1, "unknown user");
+			target_pw = xgetpwnam(optarg);
 			break;
 		case 'n':
-			nflag = 1;
+			nflag = true;
 			break;
 		case 'S':
-			Sflag = 1;	
+			Sflag = true;
+			fallthrough;
 		case 's':
-			sflag = 1;
+			sflag = true;
 			break;
 		default:
 			usage();
-			break;
 		}
 	}
-	argv += optind;
-	argc -= optind;
 
-	if (confpath) {
-		if (sflag)
-			usage();
-	} else if ((!sflag && !argc) || (sflag && argc))
+	argc -= optind;
+	argv += optind;
+
+	if (sflag == (cmd != NULL || confpath != NULL || argc != 0)
+	 || (cmd != NULL && argc != 0))
 		usage();
 
-	temp_pw = getpwuid(uid);
-        original_pw = copyenvpw(temp_pw);
-	if (! original_pw)
-		err(1, "getpwuid failed");
-	if (strlcpy(myname, original_pw->pw_name, sizeof(myname)) >= sizeof(myname))
-		errx(1, "pw_name too long");
+	original_pw = xgetpwuid(getuid());
 
-	ngroups = getgroups(NGROUPS_MAX, groups);
-	if (ngroups == -1)
-		err(1, "can't get groups");
+	if (target_pw == NULL)
+		target_pw = xgetpwuid(ROOT_UID);
+
+	/* Get number of groups.  */
+	ngroups = getgroups(0, NULL);
+
+	if (ngroups < 0)
+		err(EXIT_FAILURE, "can not get count of groups");
+
+	groups = xmalloc((ngroups + 1) * sizeof(*groups));
+	ngroups = getgroups(ngroups, groups);
+
+	if (ngroups < 0)
+		err(EXIT_FAILURE, "can not get groups");
+
 	groups[ngroups++] = getgid();
 
+	if (cmd != NULL) {
+		argc = 3;
+		argv -= optind;
+
+		argv[0] = getshell(target_pw);
+		argv[1] = (char *)"-c";
+		argv[2] = (char *)cmd;
+		argv[3] = NULL;
+	}
+
 	if (sflag) {
-		sh = getenv("SHELL");
-		if (sh == NULL || *sh == '\0') {
-			shargv[0] = strdup(original_pw->pw_shell);
-			if (shargv[0] == NULL)
-				err(1, NULL);
-		} else
-			shargv[0] = sh;
-		argv = shargv;
 		argc = 1;
+		argv -= optind;
+
+		argv[0] = getshell(target_pw);
+		argv[1] = NULL;
 	}
 
-	if (confpath) {
-		checkconfig(confpath, argc, argv, uid, groups, ngroups,
-		    target);
-		exit(1);	/* fail safe */
+	if (confpath != NULL) {
+		safe_pledge("stdio rpath getpw id", NULL);
+		check_config(confpath, argc, (char const *const *)argv,
+			     original_pw->pw_uid, groups, ngroups,
+			     target_pw->pw_uid);
 	}
 
-	if (geteuid())
-		errx(1, "not installed setuid");
+	if (geteuid() != ROOT_UID)
+		errc(EXIT_FAILURE, EPERM, "not installed setuid");
 
-	parseconfig(DOAS_CONF, 1);
+	check_permissions(DOAS_CONF);
 
-	/* cmdline is used only for logging, no need to abort on truncate */
+	if (parse_config(DOAS_CONF) != 0)
+		exit(EXIT_FAILURE);
+
+	/* cmdline is used only for logging, no need to abort
+	   on truncate.	 */
 	(void)strlcpy(cmdline, argv[0], sizeof(cmdline));
-	for (i = 1; i < argc; i++) {
-		if (strlcat(cmdline, " ", sizeof(cmdline)) >= sizeof(cmdline))
+
+	for (i = 1; i < argc; i++)
+		if (strlcat(cmdline, " ", sizeof(cmdline)) >= sizeof(cmdline)
+		 || strlcat(cmdline, argv[i], sizeof(cmdline)) >= sizeof(cmdline))
 			break;
-		if (strlcat(cmdline, argv[i], sizeof(cmdline)) >= sizeof(cmdline))
-			break;
+
+	if (!permit(original_pw->pw_uid, groups, ngroups, target_pw->pw_uid, argc, (char const *const *)argv, &rule)) {
+		syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed command for %s: %s",
+		       original_pw->pw_name, cmdline);
+		errc(EXIT_FAILURE, EPERM, "%s", original_pw->pw_name);
 	}
 
-	cmd = argv[0];
-	if (!permit(uid, groups, ngroups, &rule, target, cmd,
-	    (const char **)argv + 1)) {
-		syslog(LOG_AUTHPRIV | LOG_NOTICE,
-		    "failed command for %s: %s", myname, cmdline);
-		errc(1, EPERM, NULL);
-	}
+	xfree(groups);
 
-	if (Sflag) {
-		argv[0] = "-doas";
-	}
+	if (cmd != NULL)
+		if (rule->argv != NULL)
+			errx(EXIT_FAILURE, "-c option is not allowed if arguments are specified in rule");
 
-	if (!(rule->options & NOPASS)) {
+	formerpath = getenv("PATH");
+
+	if (formerpath == NULL)
+		formerpath = (char *)"";
+
+	argv0 = argv[0];
+
+	if (Sflag)
+		argv[0] = (char *)"-doas";
+
+#if defined(USE_TIMESTAMP)
+	if (rule->persist_time != 0)
+		timestamp_fd = timestamp_open(&timestamp_valid, rule->persist_time);
+
+	if (!rule->nopass && (timestamp_fd < 0 || !timestamp_valid)) {
+#else
+	if (!rule->nopass) {
+#endif
 		if (nflag)
-			errx(1, "Authorization required");
+			errx(EXIT_FAILURE, "Authorization required");
 
-#if defined(USE_BSD_AUTH) 
-		authuser(myname, login_style, rule->options & PERSIST);
-#elif defined(USE_PAM)
-#define PAM_END(msg) do { 						\
-	syslog(LOG_ERR, "%s: %s", msg, pam_strerror(pamh, pam_err)); 	\
-	warnx("%s: %s", msg, pam_strerror(pamh, pam_err));		\
-	pam_end(pamh, pam_err);						\
-	exit(EXIT_FAILURE);						\
-} while (/*CONSTCOND*/0)
-		pam_handle_t *pamh = NULL;
-		int pam_err;
-
-/* #ifndef linux */
-		int temp_stdin;
-
-		/* openpam_ttyconv checks if stdin is a terminal and
-		 * if it is then does not bother to open /dev/tty.
-		 * The result is that PAM writes the password prompt
-		 * directly to stdout.  In scenarios where stdin is a
-		 * terminal, but stdout is redirected to a file
-		 * e.g. by running doas ls &> ls.out interactively,
-		 * the password prompt gets written to ls.out as well.
-		 * By closing stdin first we forces PAM to read/write
-		 * to/from the terminal directly.  We restore stdin
-		 * after authenticating. */
-		temp_stdin = dup(STDIN_FILENO);
-		if (temp_stdin == -1)
-			err(1, "dup");
-		close(STDIN_FILENO);
-/* #else */
-		/* force password prompt to display on stderr, not stdout */
-		int temp_stdout = dup(1);
-		if (temp_stdout == -1)
-			err(1, "dup");
-		close(1);
-		if (dup2(2, 1) == -1)
-			err(1, "dup2");
-/* #endif */
-
-		pam_err = pam_start("doas", myname, &pamc, &pamh);
-		if (pam_err != PAM_SUCCESS) {
-			if (pamh != NULL)
-				PAM_END("pam_start");
-			syslog(LOG_ERR, "pam_start failed: %s",
-			    pam_strerror(pamh, pam_err));
-			errx(EXIT_FAILURE, "pam_start failed");
+		authenticate(original_pw, target_pw, login_style, rule->persist_time);
+#if defined(USE_TIMESTAMP)
+		if (timestamp_fd >= 0) {
+			timestamp_set(timestamp_fd, rule->persist_time);
+			close(timestamp_fd);
 		}
-
-		switch (pam_err = pam_authenticate(pamh, PAM_SILENT)) {
-		case PAM_SUCCESS:
-			switch (pam_err = pam_acct_mgmt(pamh, PAM_SILENT)) {
-			case PAM_SUCCESS:
-				break;
-
-			case PAM_NEW_AUTHTOK_REQD:
-				pam_err = pam_chauthtok(pamh,
-				    PAM_SILENT|PAM_CHANGE_EXPIRED_AUTHTOK);
-				if (pam_err != PAM_SUCCESS)
-					PAM_END("pam_chauthtok");
-				break;
-
-			case PAM_AUTH_ERR:
-			case PAM_USER_UNKNOWN:
-			case PAM_MAXTRIES:
-				syslog(LOG_AUTHPRIV | LOG_NOTICE,
-				    "failed auth for %s", myname);
-                                errx(EXIT_FAILURE, "second authentication failed");
-				break;
-
-			default:
-				PAM_END("pam_acct_mgmt");
-				break;
-			}
-			break;
-
-		case PAM_AUTH_ERR:
-		case PAM_USER_UNKNOWN:
-		case PAM_MAXTRIES:
-			syslog(LOG_AUTHPRIV | LOG_NOTICE,
-			    "failed auth for %s", myname);
-                        errx(EXIT_FAILURE, "authentication failed");
-			break;
-
-		default:
-			PAM_END("pam_authenticate");
-			break;
-		}
-		pam_end(pamh, pam_err);
-
-#ifndef linux
-		/* Re-establish stdin */
-		if (dup2(temp_stdin, STDIN_FILENO) == -1)
-			err(1, "dup2");
-		close(temp_stdin);
-#else 
-		/* Re-establish stdout */
-		close(1);
-		if (dup2(temp_stdout, 1) == -1)
-			err(1, "dup2");
-#endif
-#else
-#error	No auth module!
 #endif
 	}
 
-        /*
-	if (pledge("stdio rpath getpw exec id", NULL) == -1)
-		err(1, "pledge");
-        */
-	temp_pw = getpwuid(target);
-        target_pw = copyenvpw(temp_pw);
-	if (! target_pw)
-		errx(1, "no passwd entry for target");
+	safe_pledge("stdio rpath exec getpw id", NULL);
 
-        
-#if defined(HAVE_LOGIN_CAP_H)
-	if (setusercontext(NULL, target_pw, target, LOGIN_SETGROUP |
-	    LOGIN_SETPRIORITY | LOGIN_SETRESOURCES | LOGIN_SETUMASK |
-	    LOGIN_SETUSER) != 0)
-		errx(1, "failed to set user context for target");
-#else
-	#if defined(__linux__) || defined(__FreeBSD__)
-	if (setresgid(target_pw->pw_gid, target_pw->pw_gid, target_pw->pw_gid) == -1)
-		err(1, "setresgid");
-	#else
-	if (setregid(target_pw->pw_gid, target_pw->pw_gid) == -1)
-		err(1, "setregid");
-	#endif
-	if (initgroups(target_pw->pw_name, target_pw->pw_gid) == -1)
-		err(1, "initgroups");
-	#if defined(__linux__) || defined(__FreeBSD__)
-	if (setresuid(target, target, target) == -1)
-		err(1, "setresuid");
-	#else
-	if (setreuid(target, target) == -1)
-		err(1, "setreuid");
-	#endif
-#endif
-        /*
-	if (pledge("stdio rpath exec", NULL) == -1)
-		err(1, "pledge");
-        */
+	substitute(target_pw);
 
-	if (getcwd(cwdpath, sizeof(cwdpath)) == NULL)
-		cwd = "(failed)";
-	else
-		cwd = cwdpath;
+	safe_pledge("stdio rpath exec", NULL);
 
-	/*
-        if (pledge("stdio exec", NULL) == -1)
-		err(1, "pledge");
-        */
+	/* Skip logging if NOLOG is set.  */
+	if (!rule->nolog) {
+		char cwdpath[PATH_MAX];
+		char const *cwd;
 
-        /* skip logging if NOLOG is set */
-        if (!(rule->options & NOLOG))
-        {
-	    syslog(LOG_AUTHPRIV | LOG_INFO, "%s ran command %s as %s from %s",
-	            myname, cmdline, target_pw->pw_name, cwd);
-        }
+		if (getcwd(cwdpath, sizeof(cwdpath)) == NULL)
+			cwd = "(failed)";
+		else
+			cwd = cwdpath;
 
-	envp = prepenv(rule, original_pw, target_pw);
-
-	if (rule->cmd) {
-		if (setenv("PATH", safepath, 1) == -1)
-			err(1, "failed to set PATH '%s'", safepath);
+		syslog(LOG_AUTHPRIV | LOG_INFO, "%s ran command %s as %s from %s",
+		       original_pw->pw_name, cmdline, target_pw->pw_name, cwd);
 	}
-	execvpe(cmd, argv, envp);
+
+	safe_pledge("stdio exec", NULL);
+
+	envp = prepenv(rule->env);
+
+	xfree(original_pw);
+	xfree(target_pw);
+
+	path = (rule->argv != NULL ? safepath : formerpath);
+	path_filter(path);
+
+#if HAVE_FEXECVE
+	execfd = find_and_open_program(argv0, path);
+
+	if (full_read(execfd, &hashbang, 2) != 2)
+		err(EXIT_FAILURE, "can not determine whether file is script or real executable");
+
+	/* Unfortunately, we can not use close-on-execute flag with scripts ran using shebang
+	   due to bug in fexecve() syscall.  */
+	if (hashbang[0] != '#' || hashbang[1] != '!') {
+		int flags = fcntl(execfd, F_GETFD);
+
+		if (flags < 0)
+			err(EXIT_FAILURE, "can not get flags of file descriptor");
+
+		if (!(flags & FD_CLOEXEC) && fcntl(execfd, F_SETFD, flags | FD_CLOEXEC) != 0)
+			err(EXIT_FAILURE, "can not set close-on-execute flag");
+	}
+#endif
+
+	/* setusercontext set path for the next process, so reset it for us.  */
+	if (setenv("PATH", path, 1) < 0)
+		err(EXIT_FAILURE, "failed to set PATH '%s'", path);
+
+#if HAVE_FEXECVE
+	fexecve(execfd, argv, envp);
+#else
+	execvpe(argv0, argv, envp);
+#endif
+
 	if (errno == ENOENT)
-		errx(1, "%s: command not found", cmd);
-	err(1, "%s", cmd);
-}
+		errx(EXIT_FAILURE, "%s: command not found", argv[0]);
 
+	err(EXIT_FAILURE, "%s", argv[0]);
+}

@@ -1,0 +1,13 @@
+...:TOK_ELLIPSIS
+as:TOK_AS
+deny:TOK_DENY
+execute:TOK_EXECUTE
+from:TOK_FROM
+inheritenv:TOK_INHERITENV
+keepenv:TOK_KEEPENV
+nolog:TOK_NOLOG
+nopass:TOK_NOPASS
+permit:TOK_PERMIT
+persist:TOK_PERSIST
+setenv:TOK_SETENV
+unsetenv:TOK_UNSETENV

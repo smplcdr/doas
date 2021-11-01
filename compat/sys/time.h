@@ -1,6 +1,8 @@
-/*	$OpenBSD: errc.c,v 1.2 2015/08/31 02:53:57 guenther Exp $ */
-/*-
- * Copyright (c) 1993
+/*	$OpenBSD: time.h,v 1.37 2017/12/11 23:31:16 jca Exp $	*/
+/*	$NetBSD: time.h,v 1.18 1996/04/23 10:29:33 mycroft Exp $	*/
+
+/*
+ * Copyright (c) 1982, 1986, 1993
  *	The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -26,18 +28,33 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ *
+ *	@(#)time.h	8.2 (Berkeley) 7/10/94
  */
 
-#include <err.h>
-#include <stdarg.h>
+#ifndef _SYS_TIME_H
+#define _SYS_TIME_H 1
 
-#include "compat.h"
+/* Operations on timespecs. */
+#if !defined(timespecisset)
+# define timespecisset(tsp) ((tsp)->tv_sec || (tsp)->tv_nsec)
+#endif
+#if !defined(timespeccmp)
+# define timespeccmp(tsp, usp, cmp)					\
+	(((tsp)->tv_sec == (usp)->tv_sec) 				\
+	 ? ((tsp)->tv_nsec cmp (usp)->tv_nsec) 				\
+	 : ((tsp)->tv_sec cmp (usp)->tv_sec))
+#endif
+#if !defined(timespecadd)
+# define timespecadd(tsp, usp, vsp)					\
+	do {								\
+		(vsp)->tv_sec = (tsp)->tv_sec + (usp)->tv_sec;		\
+		(vsp)->tv_nsec = (tsp)->tv_nsec + (usp)->tv_nsec;	\
+		if ((vsp)->tv_nsec >= 1000000000L) {			\
+			(vsp)->tv_sec++;				\
+			(vsp)->tv_nsec -= 1000000000L;			\
+		}							\
+	} while (0)
+#endif
 
-void errc(int eval, int code, const char *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	verrc(eval, code, fmt, ap);
-	va_end(ap);
-}
+#endif /* _SYS_TIME_H */

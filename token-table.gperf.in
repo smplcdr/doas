@@ -1,0 +1,17 @@
+%readonly-tables
+%omit-struct-type
+%struct-type
+%language=ANSI-C
+%pic
+%7bit
+%enum
+
+%define slot-name word
+%define initializer-suffix ,0,0
+%define lookup-function-name get_keyword_by_word
+%define hash-function-name mapping_hash
+%define word-array-name mappings
+
+/* See parse.y */
+struct keyword;
+%%

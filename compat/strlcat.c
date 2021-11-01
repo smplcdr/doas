@@ -16,40 +16,30 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
 #include <string.h>
+#include <sys/types.h>
+
+#include "compat.h"
 
 /*
- * Appends src to string dst of size dsize (unlike strncat, dsize is the
- * full size of dst, not space left).  At most dsize-1 characters
+ * Appends SRC to string DST of size DSIZE (unlike strncat(), DSIZE is the
+ * full size of DST, not space left).  At most DSIZE-1 characters
  * will be copied.  Always NUL terminates (unless dsize <= strlen(dst)).
- * Returns strlen(src) + MIN(dsize, strlen(initial dst)).
- * If retval >= dsize, truncation occurred.
+ * Returns strlen(SRC) + MIN(DSIZE, strlen(DST)).
+ * If returned value >= dsize, truncation occurred.
  */
-size_t
-strlcat(char *dst, const char *src, size_t dsize)
+size_t strlcat(char *const dst, const char *const src, const size_t dsize)
 {
-	const char *odst = dst;
-	const char *osrc = src;
-	size_t n = dsize;
+	char *d;
 	size_t dlen;
 
-	/* Find the end of dst and adjust bytes left but don't go past end. */
-	while (n-- != 0 && *dst != '\0')
-		dst++;
-	dlen = dst - odst;
-	n = dsize - dlen;
+	d = memchr(dst, '\0', dsize);
+	if (d == NULL)
+		return dsize + strlen(src);
 
-	if (n-- == 0)
-		return(dlen + strlen(src));
-	while (*src != '\0') {
-		if (n != 0) {
-			*dst++ = *src;
-			n--;
-		}
-		src++;
-	}
-	*dst = '\0';
+	dlen = d - dst;
+	if (dlen == dsize)
+		return dlen + strlen(src);
 
-	return(dlen + (src - osrc));	/* count does not include NUL */
+	return dlen + strlcpy(d, src, dsize - dlen);
 }

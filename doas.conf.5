@@ -13,7 +13,7 @@
 .\"WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 .\"ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\"OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-.Dd $Mdocdate: December 5 2016 $
+.Dd $Mdocdate: @ATIME@ $
 .Dt DOAS.CONF 5
 .Os
 .Sh NAME
@@ -33,9 +33,8 @@ The rules have the following format:
 .Bd -ragged -offset indent
 .Ic permit Ns | Ns Ic deny
 .Op Ar options
-.Ar identity
-.Op Ic as Ar target
-.Op Ic cmd Ar command Op Ic args No ...
+.Ar identity as target
+.Op Ic execute { Ar command line Oc Ic }
 .Ed
 .Pp
 Rules consist of the following parts:
@@ -52,58 +51,77 @@ Do not log successful command execution to
 .Xr syslogd.
 .It Ic persist
 After the user successfully authenticates, do not ask for a password
-again for some time. Works on OpenBSD only, persist is not available on Linux or FreeBSD.
-.It Ic keepenv
+again for some time. Works on Linux, FreeBSD and OpenBSD only.
+.It Ic inheritenv
 The user's environment is maintained.
 The default is to reset the environment, except for the variables
-.Ev DISPLAY 
+.Ev DISPLAY
 and
 .Ev TERM .
 
 Note: In order to be able to run most desktop (GUI) applications, the user needs to
-have the keepenv keyword specified. If keepenv is not specified then key elements, like
+have the inheritenv keyword specified. If inheritenv is not specified then key elements, like
 the user's $HOME variable, will be reset and cause the GUI application to crash.
 Users who only need to run command line applications can usually get away without
-keepenv. When in doubt, try to avoid using keepenv as it is less secure to have
+inheritenv. When in doubt, try to avoid using inheritenv as it is less secure to have
 environment variables passed to privileged users.
 
 Note: The target user's PATH variable can be set at compile time by adjusting the
 GLOBAL_PATH variable in doas's Makefile. By default, the target user's path will
 be set to "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:"
-.It Ic setenv { Oo Ar variable ... Oc Oo Ar variable=value ... Oc Ic }
+.It Ic setenv { Oo Ar variable=value ... Oc Ic }
 In addition to the variables mentioned above, keep the space-separated
 specified variables.
-Variables may also be removed with a leading
-.Sq -
-or set using the latter syntax.
-If the first character of
-.Ar value
-is a
-.Ql $
-then the value to be set is taken from the existing environment
-variable of the same name.
+.It Ic keepenv { Oo Ar variable ... Oc Ic }
+Keeps the variables in environ.
+.It Ic unsetenv { Oo Ar variable ... Oc Ic }
+Remove the variables from environ.
 .El
 .It Ar identity
-The username to match.
-Groups may be specified by prepending a colon
-.Pq Sq \&: .
-Numeric IDs are also accepted.
+It identitificates the user this rule can be applied by. User can be
+identitificated by its username (or uid), or groupname (or gid), or all together:
+
+.Bl -tag -width keepenv
+.It Ar uid
+.It Ar 'username'
+The user with specified uid or username can apply this rule.
+The user do not have to belong any special group.
+
+.It Ic from Ar gid
+.It Ic from Ar 'groupname'
+Any user from the group with specified gid or groupname can apply this rule.
+
+.It Ar uid Ic from Ar gid
+.It Ar 'username' Ic from Ar gid
+.It Ar uid Ic from Ar 'groupname'
+The user with specified uid or username and belonging to specified group with gid or groupname
+can apply this rule.
+.El
+
 .It Ic as Ar target
 The target user the running user is allowed to run the command as.
 The default is all users.
-.It Ic cmd Ar command
-The command the user is allowed or denied to run.
+.It Ic execute { Ar [ command-list ] [argument1-list] ... Ic }
+The command(s) the user is allowed or denied to run.
 The default is all commands.
 Be advised that it is best to specify absolute paths.
 If a relative path is specified, only a restricted
 .Ev PATH
 will be searched.
-.It Ic args Op Ar argument ...
-Arguments to command.
+
+Arguments lists are arguments to command.
 The command arguments provided by the user need to match those specified.
-The keyword
-.Ic args
-alone means that command must be run without any arguments.
+
+Also, instead of any of the lists, the ellepsis
+.Pq Sq \...
+can be specified, which means that anything can be inthere.
+
+The
+.Ar list
+is either just
+.Ic "string"
+or
+.Ic [ "string", "list" ].
 .El
 .Pp
 The last matching rule determines the action taken.
@@ -129,27 +147,20 @@ If quotes or backslashes are used in a word,
 it is not considered a keyword.
 .El
 .Sh NOTES
+
+Usernames and groupnames must match
+.Ar [a-z_][a-z0-9_\-]{0,30}[a-z0-9_\-$\]?
+pattern and must be enclosed in single
+.Pq Sq \&'
+quotes.
+
 To make editing the doas.conf file safer, a convenience script called
 vidoas is included with the doas software. This script can be run as
 the root user (or via doas or sudo) and automatically checks the syntax of the doas.conf file
 before installing it on the system.
 
 Please take note that it is a bad idea to assign permission to users
-implicitly, even if blocking/denying exceptions are made. For instance, try
-to avoid using rules like 
-.Bd -literal -offset indent
-permit susan as
-deny susan as root
-
-.Ed
-The above example uses two rules to permit Susan to switch to any user, except
-root. This is dangerous for two reasons. First, it means if new users,
-including ones with admin access, are added to the system later then
-Susan can use their accounts. It also means if the file is truncated or
-accessed while being updated the doas program may read the first rule
-before the second has been written, giving Susan access to everything,
-including the root account. The better approach to is explicity allow Susan
-to access only specific accounts she needs to use.
+implicitly, even if blocking/denying exceptions are made.
 
 .Sh EXAMPLES
 The following example permits users in group wsrc to build ports;
@@ -166,16 +177,38 @@ and additionally permits root to run unrestricted commands as itself.
 .Bd -literal -offset indent
 # Non-exhaustive list of variables needed to
 # build release(8) and ports(7)
-permit nopass setenv { \e
-        FTPMODE PKG_CACHE PKG_PATH SM_PATH SSH_AUTH_SOCK \e
-        DESTDIR DISTDIR FETCH_CMD FLAVOR GROUP MAKE MAKECONF \e
-        MULTI_PACKAGES NOMAN OKAY_FILES OWNER PKG_DBDIR \e
-        PKG_DESTDIR PKG_TMPDIR PORTSDIR RELEASEDIR SHARED_ONLY \e
-        SUBPACKAGE WRKOBJDIR SUDO_PORT_V1 } :wsrc
-permit setenv { -ENV PS1=$DOAS_PS1 SSH_AUTH_SOCK } :wheel
-permit nopass tedu as root cmd /usr/sbin/procmap
-permit nopass keepenv root as root
+permit nopass keepenv { \e
+        "FTPMODE", "PKG_CACHE", "PKG_PATH", "SM_PATH", "SSH_AUTH_SOCK", \e
+        "DESTDIR", "DISTDIR", "FETCH_CMD", "FLAVOR", "GROUP", "MAKE", \e
+        "MAKECONF", "MULTI_PACKAGES", "NOMAN", "OKAY_FILES", "OWNER", \e
+        "PKG_DBDIR", "PKG_DESTDIR", "PKG_TMPDIR", "PORTSDIR", "RELEASEDIR", \e
+        "SHARED_ONLY", "SUBPACKAGE", "WRKOBJDIR", "SUDO_PORT_V1" } from 'wsrc'
+permit unsetenv { "ENV" } keepenv { "PS1=$DOAS_PS1", "SSH_AUTH_SOCK" } from 'wheel'
+permit nopass 'tedu' as 'root' execute { "/usr/sbin/procmap" ... }
+permit nopass inheritenv 'root' as 'root'
+
 .Ed
+Let us clearify the meaning and usage of string lists:
+.Bd -literal -offset indent
+permit 'serge' as 'michael' execute { [ "/usr/bin/ls", "/usr/bin/cat" ] }
+.Ed
+Following this rule, Serge can execute as Michael two programs: /usr/bin/ls and /usr/bin/cat. This rule actually equal to rule below:
+.Bd -literal -offset indent
+permit 'serge' as 'michael' execute { "/usr/bin/ls" }
+permit 'serge' as 'michael' execute { "/usr/bin/cat" }
+.Ed
+
+Keep in mind, that rules
+.Bd -literal -offset indent
+permit 'serge' as 'michael' execute { "/usr/bin/ls" }
+.Ed
+and
+.Bd -literal -offset indent
+permit 'serge' as 'michael' execute { [ "/usr/bin/ls" ] }
+.Ed
+are
+.Ic absolutely equal .
+
 .Sh SEE ALSO
 .Xr doas 1
 .Sh HISTORY
@@ -184,4 +217,5 @@ The
 configuration file first appeared in
 .Ox 5.8 .
 .Sh AUTHORS
+.An Sergey Sushilin Aq Mt sergeysushilin@protonmail.com
 .An Ted Unangst Aq Mt tedu@openbsd.org

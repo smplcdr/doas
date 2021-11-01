@@ -15,7 +15,7 @@
 .\" TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 .\" PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd November 9, 2020
+.Dd $Mdocdate: "@ATIME@" $
 .Dt VIDOAS 1
 .Os
 .Sh NAME
@@ -24,6 +24,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl n
+.Op Fl e Ar EDITOR
 .Op Ar file
 .Nm
 .Fl h
@@ -39,6 +40,15 @@ The options are as follows:
 .Bl -tag -width EDITOR
 .It Fl h
 Show a usage message.
+.It Fl e Ar EDITOR
+Run
+.Ar EDITOR
+as editor for the file. If not specified,
+then will be used the editor command in
+.Ev EDITOR
+environment variable, or if it is not set, the
+.Xr vi 1
+editor program will be used.
 .It Fl n
 Do not edit the file, just perform prerequisite checks.
 If this switch is repeated, all output will be suppressed and the check
@@ -68,3 +78,4 @@ argument is specified.
 .Xr doas.conf 5
 .Sh AUTHORS
 .An Kimmo Suominen Aq Mt kim@netbsd.org
+.An Sergey Sushilin Aq Mt sergeysushilin@protonmail.com

@@ -16,35 +16,73 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
+#include <limits.h>
+#include <stdint.h>
 #include <string.h>
+#include <sys/types.h>
+
+#include "compat.h"
 
 /*
- * Copy string src to buffer dst of size dsize.  At most dsize-1
- * chars will be copied.  Always NUL terminates (unless dsize == 0).
- * Returns strlen(src); if retval >= dsize, truncation occurred.
+ * Copy string SRC to buffer DST of size DSIZE.  At most DSIZE-1
+ * characters will be copied.  Always NUL terminates (unless DSIZE == 0).
+ * Returns strlen(SRC).
+ * If strlen(SRC) >= DSIZE, truncation occurred.
  */
-size_t
-strlcpy(char *dst, const char *src, size_t dsize)
+size_t strlcpy(char *const dst, const char *const src, size_t dsize)
 {
-	const char *osrc = src;
-	size_t nleft = dsize;
+	char *d = dst;
+	const char *s = src;
+	size_t n;
 
-	/* Copy as many bytes as will fit. */
-	if (nleft != 0) {
-		while (--nleft != 0) {
-			if ((*dst++ = *src++) == '\0')
-				break;
+	/* It might happen if we were called after another strlcpy()
+	   which wrote all buffer out, so just ignore this case.  */
+	if (dsize == 0)
+		return 0;
+
+	dsize--;
+
+#if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 3)) \
+	&& !defined(_ICC) && !defined(__SUNPRO_C)
+# define ALIGN		(sizeof(word_t) - 1)
+# define ONES		(~(word_t)0 / UCHAR_MAX)
+# define HIGHS		(ONES * (1 << (CHAR_BIT - 1)))
+# define HASZERO(x)	(((x) - ONES) & ~(x) & HIGHS)
+	/* Native word size == sizeof(pointer).  */
+	typedef uintptr_t word_t __attribute__((__may_alias__));
+
+	if (((word_t)s & ALIGN) == ((word_t)d & ALIGN)) {
+		word_t *wd;
+		const word_t *ws;
+
+		while (((word_t)s & ALIGN) && dsize != 0 && *s != '\0') {
+			*d++ = *s++;
+			dsize--;
 		}
+
+		wd = (word_t *)d;
+		ws = (const word_t *)s;
+
+		while (dsize >= sizeof(word_t) && !HASZERO(*ws)) {
+			*wd++ = *ws++;
+			dsize -= sizeof(word_t);
+		}
+
+		d = (char *)wd;
+		s = (const char *)ws;
+	}
+#endif
+
+	while (dsize != 0 && *s != '\0') {
+		*d++ = *s++;
+		dsize--;
 	}
 
-	/* Not enough room in dst, add NUL and traverse rest of src. */
-	if (nleft == 0) {
-		if (dsize != 0)
-			*dst = '\0';		/* NUL-terminate dst */
-		while (*src++)
-			;
-	}
+	*d = '\0';
 
-	return(src - osrc - 1);	/* count does not include NUL */
+	n = s - src;
+	if (dsize == 0)
+		n += strlen(s);
+
+	return n;
 }

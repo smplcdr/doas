@@ -1,0 +1,10 @@
+(
+  (c-mode . ((c-file-style . "linux")
+	           (indent-tabs-mode . t)
+	           (tab-width . 8)
+	           (c-basic-offset . 8)
+             (indent-tabs-mode  . t)
+             (standart-indent  .  8)
+	           ))
+  )
+)

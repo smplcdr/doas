@@ -1,6 +1,5 @@
-/* $OpenBSD: getprogname.c,v 1.4 2016/03/13 18:34:20 guenther Exp $ */
 /*
- * Copyright (c) 2013 Antoine Jacoutot <ajacoutot@openbsd.org>
+ * Copyright (c) 2021 Sergey Sushilin <sergeysushilin@protonmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,11 +14,11 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <stdlib.h>
+#ifndef _TIMESTAMP_H
+#define _TIMESTAMP_H 1
 
-extern const char *__progname;
+extern int timestamp_set(int fd, time_t secs);
+extern int timestamp_open(bool *valid, time_t secs) __nonnull((1));
+extern int timestamp_clear(void);
 
-const char *getprogname(void)
-{
-	return (__progname);
-}
+#endif

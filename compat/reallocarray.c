@@ -15,25 +15,20 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/types.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/types.h>
 
-/*
- * This is sqrt(SIZE_MAX+1), as s1*s2 <= SIZE_MAX
- * if both s1 < MUL_NO_OVERFLOW and s2 < MUL_NO_OVERFLOW
- */
-#define MUL_NO_OVERFLOW	((size_t)1 << (sizeof(size_t) * 4))
+#include "compat.h"
 
-void *
-reallocarray(void *optr, size_t nmemb, size_t size)
+void *reallocarray(void *p, size_t n, size_t m)
 {
-	if ((nmemb >= MUL_NO_OVERFLOW || size >= MUL_NO_OVERFLOW) &&
-	    nmemb > 0 && SIZE_MAX / nmemb < size) {
+	size_t s;
+	if (__builtin_mul_overflow(n, m, &s)) {
 		errno = ENOMEM;
 		return NULL;
 	}
-	return realloc(optr, size * nmemb);
+	return realloc(p, s);
 }
-//DEF_WEAK(reallocarray);

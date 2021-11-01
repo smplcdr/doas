@@ -29,19 +29,22 @@
  */
 
 #include <err.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 
-void
-verrc(int eval, int code, const char *fmt, va_list ap)
+#include "compat.h"
+
+void verrc(int eval, int code, const char *fmt, va_list ap)
 {
 	(void)fprintf(stderr, "%s: ", getprogname());
+
 	if (fmt != NULL) {
 		(void)vfprintf(stderr, fmt, ap);
 		(void)fprintf(stderr, ": ");
 	}
+
 	(void)fprintf(stderr, "%s\n", strerror(code));
 	exit(eval);
 }

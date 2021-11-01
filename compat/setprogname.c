@@ -15,17 +15,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
-void
-setprogname(const char *progname)
+extern const char *__progname;
+
+void setprogname(const char *progname)
 {
-	char *tmpn;
+	char *p;
 
-	tmpn = strrchr(progname, '/');
-	if (tmpn == NULL)
-		__progname = (char *)progname;
-	else
-		__progname = tmpn + 1;
+	p = strrchr(progname, '/');
+	__progname = (p != NULL ? p + 1 : progname);
 }

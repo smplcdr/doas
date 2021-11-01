@@ -30,12 +30,12 @@ The doas command is in FreeBSD's ports collection and may be installed by simply
 
 ## Installing build tools
 
-1 - The doas program has virtually no dependencies. So long as you have a compiler (such as the GNU Compiler or Clang) installed and GNU make (gmake on NetBSD, FreeBSD, and illumos). On illumos, the build-essential package will install all the necessary build tools. 
+1 - The doas program has virtually no dependencies. So long as you have a compiler (such as the GNU Compiler or Clang) installed and GNU make (gmake on NetBSD, FreeBSD, and illumos). On illumos, the build-essential package will install all the necessary build tools.
 
 #### Debian and Ubuntu based distributions
 
-     sudo apt install build-essential make bison flex libpam0g-dev 
-    
+     sudo apt install build-essential make bison flex libpam0g-dev
+
 #### macOS
 
      xcode-select --install
@@ -47,7 +47,7 @@ The doas command is in FreeBSD's ports collection and may be installed by simply
 #### Linux
 
      make
-    
+
 #### FreeBSD, NetBSD and macOS
 
      gmake
@@ -59,19 +59,19 @@ The doas command is in FreeBSD's ports collection and may be installed by simply
 Alternatively, bison can be used if yacc is not installed.
 
      YACC="bison -y" PREFIX=/opt/local gmake
-   
+
 This builds the source code. Then, as the root user, run
 
 #### Linux
 
      make install
-     
+
 Note to Linux users: Some Linux distributions, such as CentOS, will block doas from using PAM authentication by default. If this happens, it is usually possible to work around the issue by running the following command as the administrator:
 
       cp /etc/pam.d/sudo /etc/pam.d/doas
 
 
-#### FreeBSD and NetBSD 
+#### FreeBSD and NetBSD
 
      gmake install
 
@@ -131,6 +131,6 @@ On Linux versions of doas prior to 6.3p1 required commands with arguments to be 
 
 ## Contributing
 
-Contributions, in various forms, are always welcome. If you run into a problem or have an improvement you'd like to see included, pelase use GitHub's tools to submit an issue ticket or a pull request. Should you encounter a bug  you feel is a security concern, please contact the developer privately at jessefrgsmith AT yahoo DOT ca.
+Contributions, in various forms, are always welcome. If you run into a problem or have an improvement you would like to see included, pelase use GitHub's tools to submit an issue ticket or a pull request. Should you encounter a bug  you feel is a security concern, please contact the developer privately at jessefrgsmith AT yahoo DOT ca.
 
 Financial donations are always welcome and can be submitted via PayPal to jessefrgsmith AT yahoo DOT ca or through Patreon at https://www.patreon.com/sysvinit . Thank you for your support.
