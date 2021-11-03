@@ -39,7 +39,7 @@ ifeq ($(UNAME_S),Linux)
     VIDOAS_COMPAT+=closefrom.o errc.o getprogname.o setprogname.o strtonum.o reallocarray.o verrc.o vwarnc.o warnc.o
 endif
 ifeq ($(UNAME_S),FreeBSD)
-    CFLAGS+=-DHAVE_LOGIN_CAP_H=1
+    CFLAGS+=-DHAVE_LOGIN_CAP_H=1 -D__BSD_VISIBLE=1
     CPPFLAGS+=-Icompat
     DOAS_COMPAT+=execvpe.o
     LDFLAGS+=-lutil

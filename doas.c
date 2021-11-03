@@ -331,7 +331,7 @@ static __nonnull((1, 2, 3)) void authenticate(struct passwd *restrict original_p
 static inline __nonnull((1)) void substitute(struct passwd const *pw)
 {
 #if defined(HAVE_LOGIN_CAP_H)
-	if (setusercontext(NULL, pw, pw->pw_uid, (Sflag ? LOGIN_SETENV : 0) | LOGIN_SETGROUP | LOGIN_SETPRIORITY | LOGIN_SETRESOURCES | LOGIN_SETUMASK | LOGIN_SETUSER) != 0)
+	if (setusercontext(NULL, pw, pw->pw_uid, LOGIN_SETLOGINCLASS | LOGIN_SETGROUP | LOGIN_SETPRIORITY | LOGIN_SETRESOURCES | LOGIN_SETUMASK | LOGIN_SETUSER) != 0)
 		errx(EXIT_FAILURE, "failed to set user context for target");
 #else
 	umask(022);
@@ -360,7 +360,11 @@ static inline bool checkshell(char const *shell)
 static inline __returns_nonnull char *getshell(struct passwd const *target_pw)
 {
 	size_t i;
-	char const *const shells[] = { getenv("SHELL"), target_pw->pw_shell, _PATH_BSHELL };
+	char const *const shells[] = {
+		getenv("SHELL"),
+		target_pw->pw_shell,
+		_PATH_BSHELL
+	};
 
 	for (i = 0; i < countof(shells); i++)
 		if (checkshell(shells[i]))
@@ -714,8 +718,8 @@ int main(int argc, char **argv)
 	if (full_read(execfd, &hashbang, 2) != 2)
 		err(EXIT_FAILURE, "can not determine whether file is script or real executable");
 
-	/* Unfortunately, we can not use close-on-execute flag with scripts ran using shebang
-	   due to bug in fexecve() syscall.  */
+	/* Unfortunately, we can not use close-on-execute flag with
+	   scripts ran using shebang due to bug in fexecve() syscall.  */
 	if (hashbang[0] != '#' || hashbang[1] != '!') {
 		int flags = fcntl(execfd, F_GETFD);
 

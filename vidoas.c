@@ -92,7 +92,7 @@ static inline void default_signals(void)
 static inline void safe_stat(char const *file, struct stat *sb)
 {
 	if (stat(file, sb) != 0)
-		err(EXIT_FAILURE, "stat");
+		err(EXIT_FAILURE, "%s", file);
 }
 
 static inline off_t safe_lseek(int fd, off_t offset, int whence)
@@ -255,7 +255,7 @@ static inline void cp(int srcfd, int dstfd)
 	if (ftruncate(dstfd, sz) < 0)
 		err(EXIT_FAILURE, "ftruncate");
 
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#if defined(__APPLE__)
 	if (fcopyfile(srcfd, dstfd, 0, COPYFILE_ALL) >= 0)
 		goto lend;
 #endif

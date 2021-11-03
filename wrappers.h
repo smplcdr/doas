@@ -23,7 +23,9 @@
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
-#include <shadow.h>
+#if defined(USE_SHADOW)
+# include <shadow.h>
+#endif
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
